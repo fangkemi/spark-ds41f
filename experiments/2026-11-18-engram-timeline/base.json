@@ -1,0 +1,5 @@
+{
+  "deployment_commit": "c0e4124f76f627ed973e788fc0517d1eb0eb1a56",
+  "vllm_patch_head": "c0097f3ece9bdbd1da856c4466d5fd37856e9e57",
+  "image_id": "sha256:e88f679d9a7d5d67c8a9f052c48e638c76856cf8432ff1872e590c2b707fa95b"
+}

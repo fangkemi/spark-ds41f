@@ -1,0 +1,275 @@
+From 8fd22440de8005203ad64985c9606abadb26f363 Mon Sep 17 00:00:00 2001
+From: kemi <kemi@localhost>
+Date: Wed, 18 Nov 2026 11:39:40 +0800
+Subject: [PATCH] fix: retain each Engram GPU wait until timeline export
+
+Base: c0097f3ece9bdbd1da856c4466d5fd37856e9e57 (C61). Debug timing only, no model arithmetic changes. Use a sequence-indexed mapped ring and same-step acquire join. Pending steps stay queued and overflow is explicit. Tests cover delayed reads, early-prefetch bursts, final steps, slot wrap and 64-bit waits. Upstream status: local candidate.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 38 ++++++++++--
+ .../deepseek_v4_1/engram_rows/_native.py      |  2 +-
+ .../deepseek_v4_1/engram_rows/_reader.c       | 62 ++++++++++++++-----
+ vllm/models/deepseek_v4_1/engram_rows/rows.py | 11 +++-
+ .../deepseek_v4_1/tilelang/engram_rows.py     | 20 ++++--
+ 5 files changed, 102 insertions(+), 31 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index e2098f566..e3d813b56 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -498,13 +498,41 @@ for r in records:
+     assert r["submitted"] <= r["started"] <= r["ids"] <= r["read"] <= r["published"], r
+     assert r["count"] == 4 * t.HEADS and r["early"] == 0
+     assert 0 < r["plan_ns"] <= r["read"] - r["ids"], r
+-# Step 1's kernels compile on the host while its rows are read, so its wait is short;
+-# the GPU waited for step 2's delayed rows, and step 3's service saw that wait.
+-assert records[1]["gpu_sequence"] == 1, records[1]
+-third = records[2]
+-assert third["gpu_sequence"] == 2 and third["gpu_wait_ns"] > 10_000_000, third
++# Same-step join includes the final step without a fourth request.
++assert all(r["gpu_sequence"] == r["sequence"] for r in records), records
++assert records[1]["gpu_wait_ns"] > 10_000_000, records[1]
++assert records[2]["gpu_wait_ns"] > 10_000_000, records[2]
+ assert rows.timeline() == []
+ rows.close()
++
++rows = t._rows(paths, tokens=4, timeline=True)
++for _ in range(12):
++    t._step(rows, first, 4, early=first.cpu().numpy())
++torch.cuda.synchronize()
++records = rows.timeline()
++assert [r["sequence"] for r in records] == list(range(1,13)), records
++assert all(r["gpu_sequence"] == r["sequence"] for r in records), records
++assert all(r["gpu_wait_ns"] >= 0 for r in records), records
++assert rows.timeline() == []
++rows.close()
++
++# Exercise ring-slot wrap and the 64-bit duration export without a multi-second stall.
++rows = t._rows(paths, tokens=4, timeline=True)
++rows._sequence = 8190
++rows._control[rows.native.CTRL_IDS_SEQ] = 8190
++rows._control[rows.native.CTRL_ROWS_SEQ] = 8190
++rows._control[rows.native.CTRL_CONSUMED_SEQ] = 8190
++for _ in range(3):
++    t._step(rows, first, 4)
++torch.cuda.synchronize()
++slot = rows.native.CTRL_WORDS + (8192 % 8192) * 4
++rows._control[slot + 1] = 123
++rows._control[slot + 2] = 2
++records = rows.timeline()
++assert [r["sequence"] for r in records] == [8191,8192,8193], records
++assert all(r["gpu_sequence"] == r["sequence"] for r in records), records
++assert records[1]["gpu_wait_ns"] == (2 << 32) + 123, records[1]
++rows.close()
+ """
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_native.py b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+index 58b823221..73cf1fd93 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_native.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+@@ -26,7 +26,7 @@ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_reader.c")
+ _NAME = "_engram_rows_reader"
+ _DEFAULT_PREBUILT_ROOT = Path("/opt/spark-ds41f/native")
+-ABI_VERSION = 5
++ABI_VERSION = 6
+ 
+ 
+ def _pkg_config(*args: str) -> str:
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index f8820b18e..2cc379e72 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -57,7 +57,7 @@ static void system_error(failure_t *failure, const char *operation) {
+ #include "_row_plan.h"
+ 
+ #define READER_CAPSULE "vllm.engram_rows.reader"
+-#define ABI_VERSION 5
++#define ABI_VERSION 6
+ 
+ /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
+ #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
+@@ -71,6 +71,9 @@ static void system_error(failure_t *failure, const char *operation) {
+ #define CTRL_PHASE 48       /* the worker: PHASE_* */
+ #define CTRL_PHASE_SEQ 49   /* the worker: the step it is on */
+ #define CTRL_WORDS 64
++#define TIMELINE 8192
++#define GPU_TIMELINE_STRIDE 4
++#define GPU_TIMELINE_WORDS (TIMELINE * GPU_TIMELINE_STRIDE)
+ 
+ enum { PHASE_IDLE = 0, PHASE_WAITING_IDS = 1, PHASE_READING = 2, PHASE_FAILED = 3, PHASE_WAITING_CONSUMED = 4 };
+ 
+@@ -94,13 +97,13 @@ typedef struct {
+     uint64_t submitted; /* when the host queued the step (CLOCK_MONOTONIC ns) */
+ } step_t;
+ 
+-/* Debug (timeline): one record per served step, times in CLOCK_MONOTONIC ns. The GPU's
+- * wait is the last one it recorded when the step's service began: the previous step's. */
++/* Debug timeline: host timestamps use CLOCK_MONOTONIC. GPU waits are joined
++ * by the same step sequence at export, after its ring entry has been published. */
+ typedef struct {
+-    uint32_t sequence, count, early, gpu_sequence, gpu_wait_ns;
++    uint32_t sequence, count, early, gpu_sequence;
++    uint64_t gpu_wait_ns;
+     uint64_t submitted, started, consumed, ids, read, published, plan_ns;
+ } record_t;
+-#define TIMELINE 8192
+ 
+ typedef struct {
+     ple_plan_t plan;
+@@ -580,13 +583,8 @@ static void serve(reader_t *reader, step_t step) {
+         return;
+     }
+     uint64_t started = now_ns();
+-    uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
+     reader->step_plan_ns = 0;
+     reader->plan.job_count = 0;
+-    if (reader->timeline) {
+-        gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
+-        gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
+-    }
+     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
+     uint64_t early_count = 0, fadvise_early = 0;
+     double consumed_wait = 0.0, early_read = 0.0;
+@@ -633,7 +631,7 @@ static void serve(reader_t *reader, step_t step) {
+     reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
+     reader->read_seconds += (double)(read_at - ids_at) * 1e-9;
+     if (reader->timeline) {
+-        record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
++        record_t record = {step.sequence, step.count, (uint32_t)early_count, 0, 0,
+                            step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
+                            ids_at, read_at, published_at, reader->step_plan_ns};
+         reader->timeline[reader->timeline_next++ % TIMELINE] = record;
+@@ -1447,16 +1445,47 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
+         return PyErr_NoMemory();
+     }
+     uint64_t first, last;
++    bool overflow = false;
+     pthread_mutex_lock(&reader->mutex);
++    first = reader->timeline_read;
+     last = reader->timeline_next;
+-    first = reader->timeline_read + TIMELINE < last ? last - TIMELINE : reader->timeline_read;
+-    for (uint64_t i = first; i < last; i++) copy[i - first] = reader->timeline[i % TIMELINE];
+-    reader->timeline_read = last;
++    if (last - first > TIMELINE) {
++        overflow = true;
++    } else {
++        uint64_t ready = first;
++        for (; ready < last; ready++) {
++            record_t record = reader->timeline[ready % TIMELINE];
++            uint32_t *slot = reader->control + CTRL_WORDS
++                + (record.sequence % TIMELINE) * GPU_TIMELINE_STRIDE;
++            uint32_t sequence = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
++            if (sequence != record.sequence) {
++                overflow = (int32_t)(sequence - record.sequence) > 0;
++                break; /* The GPU has not completed this step yet. Retry next export. */
++            }
++            uint64_t low = __atomic_load_n(slot + 1, __ATOMIC_RELAXED);
++            uint64_t high = __atomic_load_n(slot + 2, __ATOMIC_RELAXED);
++            if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) != sequence) {
++                overflow = true;
++                break;
++            }
++            record.gpu_sequence = sequence;
++            record.gpu_wait_ns = low | (high << 32);
++            copy[ready - first] = record;
++        }
++        last = ready;
++        if (!overflow) reader->timeline_read = last;
++    }
+     pthread_mutex_unlock(&reader->mutex);
++    if (overflow) {
++        free(copy);
++        Py_DECREF(result);
++        PyErr_SetString(PyExc_RuntimeError, "Engram timeline overflow: GPU wait coverage is incomplete");
++        return NULL;
++    }
+     for (uint64_t i = 0; i < last - first; i++) {
+         record_t *r = &copy[i];
+-        PyObject *row = Py_BuildValue("(IIIIIKKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
+-                                      r->gpu_wait_ns, (unsigned long long)r->submitted,
++        PyObject *row = Py_BuildValue("(IIIIKKKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
++                                      (unsigned long long)r->gpu_wait_ns, (unsigned long long)r->submitted,
+                                       (unsigned long long)r->started, (unsigned long long)r->consumed,
+                                       (unsigned long long)r->ids, (unsigned long long)r->read,
+                                       (unsigned long long)r->published, (unsigned long long)r->plan_ns);
+@@ -1504,6 +1533,7 @@ PyMODINIT_FUNC PyInit__engram_rows_reader(void) {
+         PyModule_AddIntConstant(result, "CTRL_GPU_WAIT_NS", CTRL_GPU_WAIT_NS) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_PHASE", CTRL_PHASE) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_PHASE_SEQ", CTRL_PHASE_SEQ) < 0 ||
++        PyModule_AddIntConstant(result, "GPU_TIMELINE_WORDS", GPU_TIMELINE_WORDS) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_WORDS", CTRL_WORDS) < 0) {
+         Py_DECREF(result);
+         return NULL;
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index b1d41eccb..cbe6134af 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -226,7 +226,10 @@ class EngramDiskRows:
+             self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+             self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+             self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+-            self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
++            control_words = self.native.CTRL_WORDS
++            if self.timeline_enabled or os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1":
++                control_words += self.native.GPU_TIMELINE_WORDS
++            self.control = self._mapped((control_words,), torch.int32, False)
+             self.control.host.zero_()
+             self._control = self.control.host.numpy().view(np.uint32)
+             self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+@@ -382,8 +385,10 @@ class EngramDiskRows:
+         Times are CLOCK_MONOTONIC ns: the host queued the step (submitted), the worker
+         began it (started), saw the previous step gathered (consumed, early rows only),
+         saw the GPU's IDs (ids), read the rows (read) and published them (published).
+-        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one; plan_ns
+-        the time the step's reads spent planning (sorting and merging its lookups)."""
++        gpu_wait_ns is the GPU's wait for this same step (gpu_sequence == sequence); plan_ns
++        the time the step's reads spent planning (sorting and merging its lookups).
++        Incomplete GPU steps remain queued until a later export. Overflow raises
++        rather than silently dropping records. No subsequent request is required."""
+         rows = self.native.timeline(self._reader)
+         return [dict(zip(self.TIMELINE_FIELDS, row)) for row in rows]
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 2441ba0fd..200937f92 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -34,7 +34,9 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
+ HEADS = 24
+ ROW = 256
+ SCALES = ROW // 32
+-CONTROL_WORDS = 64
++TIMELINE_SLOTS = 8192
++_TIMELINE_ENABLED = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
++CONTROL_WORDS = 64 + (TIMELINE_SLOTS * 4 if _TIMELINE_ENABLED else 0)
+ 
+ # Debug only: the wait records each wait's length for the reader's timeline
+ # (SPARK_DS41F_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
+@@ -89,13 +91,19 @@ __device__ __forceinline__ unsigned engram_wait_rows_cta(void *control, int is_l
+                 unsigned long long left;
+                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
+                 unsigned long long ns = left - entered;
+-                unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
++                // One GPU writer owns each sequence slot. Publish its sequence
++                // after both halves of the 64-bit duration are visible to the CPU.
++                unsigned *slot = ctrl + 64 + (target % 8192u) * 4;
++                unsigned low = (unsigned)ns, high = (unsigned)(ns >> 32);
++                unsigned invalid = target ^ 0x80000000u;
++                asm volatile("st.release.sys.global.u32 [%0], %1;"
++                             :: "l"(slot), "r"(invalid) : "memory");
++                asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
++                             :: "l"(slot + 1), "r"(low) : "memory");
+                 asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
+-                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
+-                             : "memory");
++                             :: "l"(slot + 2), "r"(high) : "memory");
+                 asm volatile("st.release.sys.global.u32 [%0], %1;"
+-                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
+-                             : "memory");
++                             :: "l"(slot), "r"(target) : "memory");
+             }
+ #endif
+             return target;
+-- 
+2.43.0
+

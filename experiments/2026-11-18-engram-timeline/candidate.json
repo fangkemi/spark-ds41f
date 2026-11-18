@@ -1,0 +1,10 @@
+{
+  "base": "../2026-11-16-c61-decode/upstreams.lock.json",
+  "upstreams_config": "experiments/2026-11-18-engram-timeline/upstreams.lock.json",
+  "environment": {
+    "SPARK_DS41F_ENGRAM_TIMELINE": "1"
+  },
+  "image": "spark-ds41f:c61-engram-timeline-complete-20261118",
+  "expected_vllm_tree": "1543ef317f6e0387f15fdaf061034a062df8f2da",
+  "purpose": "Repair debug wait coverage, then measure complete TP4 Engram waits."
+}
